@@ -106,6 +106,7 @@ type AgentEventState = {
   listeners: Set<(evt: AgentEventRuntimePayload) => void>;
   auditListeners: Set<(evt: AgentEventPayload) => void>;
   runContextById: Map<string, AgentRunContext>;
+  queuedRunContextLeases?: WeakMap<AgentRunContext, number>;
   runContextOwnersById?: Map<
     string,
     {
@@ -393,6 +394,49 @@ export function getAgentRunContext(runId: string) {
   return getAgentEventState().runContextById.get(runId);
 }
 
+/** Holds an existing run context only while its current execution awaits lane admission. */
+export function retainQueuedAgentRunContext(
+  runId: string,
+  lifecycleGeneration: string,
+): ((outcome: "admitted" | "abandoned") => void) | undefined {
+  const state = getAgentEventState();
+  const context = state.runContextById.get(runId);
+  if (
+    !context ||
+    context.lifecycleGeneration !== lifecycleGeneration ||
+    state.lifecycleGeneration !== lifecycleGeneration
+  ) {
+    return undefined;
+  }
+
+  const leases = (state.queuedRunContextLeases ??= new WeakMap<AgentRunContext, number>());
+  leases.set(context, (leases.get(context) ?? 0) + 1);
+  let released = false;
+
+  return (outcome) => {
+    if (released) {
+      return;
+    }
+    released = true;
+    const remaining = (leases.get(context) ?? 0) - 1;
+    if (remaining > 0) {
+      leases.set(context, remaining);
+    } else {
+      leases.delete(context);
+    }
+
+    // A recycled run id or rotated lifecycle must not inherit the old queue's activity.
+    if (
+      outcome === "admitted" &&
+      state.runContextById.get(runId) === context &&
+      context.lifecycleGeneration === lifecycleGeneration &&
+      state.lifecycleGeneration === lifecycleGeneration
+    ) {
+      context.lastActiveAt = Date.now();
+    }
+  };
+}
+
 /** Records the latest next-check proposal on the matching paced cron run. */
 export function recordCronNextCheckProposal(runId: string, jobId: string, delayMs: number): void {
   const context = getAgentEventState().runContextById.get(runId);
@@ -569,6 +613,13 @@ export function sweepStaleRunContexts(maxAgeMs = 30 * 60 * 1000): number {
   const now = Date.now();
   let swept = 0;
   for (const [runId, ctx] of state.runContextById.entries()) {
+    // Queue capacity waits are live ownership, but never protect a retired lifecycle.
+    if (
+      ctx.lifecycleGeneration === state.lifecycleGeneration &&
+      (state.queuedRunContextLeases?.get(ctx) ?? 0) > 0
+    ) {
+      continue;
+    }
     // Use lastActiveAt (refreshed on every event) to avoid sweeping active runs.
     // Fall back to registeredAt, then treat missing timestamps as infinitely old.
     const lastSeen = ctx.lastActiveAt ?? ctx.registeredAt;
@@ -768,5 +819,6 @@ export function resetAgentEventsForTest(options?: { preserveListeners?: boolean 
     state.auditListeners.clear();
   }
   state.runContextById.clear();
+  state.queuedRunContextLeases = undefined;
   getAgentRunContextOwners(state).clear();
 }

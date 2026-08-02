@@ -18,6 +18,7 @@ import {
   registerAgentRunContext,
   releaseAgentRunContext,
   resetAgentEventsForTest,
+  retainQueuedAgentRunContext,
   rotateAgentEventLifecycleGeneration,
   runOncePerAgentRun,
   sweepStaleRunContexts,
@@ -965,6 +966,101 @@ describe("agent-events sequencing", () => {
       { runId: "run-stale", seq: 1 },
       { runId: "run-active", seq: 2 },
     ]);
+  });
+
+  test("protects only active queue leases while stale tracked and abandoned owners expire", () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
+    const lifecycleGeneration = getAgentEventLifecycleGeneration();
+    registerAgentRunContext("queued-run", { lifecycleGeneration, registeredAt: 100 });
+    registerAgentRunContext("abandoned-run", { lifecycleGeneration, registeredAt: 100 });
+    claimAgentRunContext(
+      "tracked-worker-run",
+      { lifecycleGeneration, registeredAt: 100 },
+      { exclusive: true, ownsContext: true, trackOwner: true },
+    );
+
+    const firstLease = retainQueuedAgentRunContext("queued-run", lifecycleGeneration);
+    const secondLease = retainQueuedAgentRunContext("queued-run", lifecycleGeneration);
+    expect(firstLease).toBeTypeOf("function");
+    expect(secondLease).toBeTypeOf("function");
+    expect(retainQueuedAgentRunContext("missing-run", lifecycleGeneration)).toBeUndefined();
+    expect(retainQueuedAgentRunContext("queued-run", "stale-generation")).toBeUndefined();
+
+    clock.mockReturnValue(1_000);
+    expect(sweepStaleRunContexts(500)).toBe(2);
+    expect(getAgentRunContext("queued-run")).toBeDefined();
+    expect(getAgentRunContext("abandoned-run")).toBeUndefined();
+    expect(getAgentRunContext("tracked-worker-run")).toBeUndefined();
+
+    firstLease?.("admitted");
+    firstLease?.("abandoned");
+    expect(getAgentRunContext("queued-run")?.lastActiveAt).toBe(1_000);
+
+    clock.mockReturnValue(1_501);
+    expect(sweepStaleRunContexts(500)).toBe(0);
+    secondLease?.("abandoned");
+    expect(sweepStaleRunContexts(500)).toBe(1);
+    expect(getAgentRunContext("queued-run")).toBeUndefined();
+    clock.mockRestore();
+  });
+
+  test("never protects a retired lifecycle or refreshes a recycled run context", () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
+    const originalGeneration = getAgentEventLifecycleGeneration();
+    registerAgentRunContext("recycled-run", {
+      lifecycleGeneration: originalGeneration,
+      registeredAt: 100,
+    });
+    const releaseOriginalLease = retainQueuedAgentRunContext("recycled-run", originalGeneration);
+
+    clock.mockReturnValue(1_000);
+    expect(sweepStaleRunContexts(500)).toBe(0);
+
+    const replacementGeneration = rotateAgentEventLifecycleGeneration();
+    expect(sweepStaleRunContexts(500)).toBe(1);
+    claimAgentRunContext("recycled-run", {
+      lifecycleGeneration: replacementGeneration,
+      registeredAt: 100,
+    });
+
+    releaseOriginalLease?.("admitted");
+    expect(getAgentRunContext("recycled-run")).toMatchObject({
+      lifecycleGeneration: replacementGeneration,
+      registeredAt: 100,
+    });
+    expect(getAgentRunContext("recycled-run")?.lastActiveAt).toBeUndefined();
+    expect(sweepStaleRunContexts(500)).toBe(1);
+    clock.mockRestore();
+  });
+
+  test("shares queue leases across duplicate modules without leaking through test resets", async () => {
+    const first = await importAgentEventsModule(`queued-first-${Date.now()}`);
+    const second = await importAgentEventsModule(`queued-second-${Date.now()}`);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
+    const lifecycleGeneration = first.getAgentEventLifecycleGeneration();
+    first.registerAgentRunContext("duplicate-module-run", {
+      lifecycleGeneration,
+      registeredAt: 100,
+    });
+    const releaseOriginalLease = second.retainQueuedAgentRunContext(
+      "duplicate-module-run",
+      lifecycleGeneration,
+    );
+
+    clock.mockReturnValue(1_000);
+    expect(first.sweepStaleRunContexts(500)).toBe(0);
+
+    first.resetAgentEventsForTest();
+    first.registerAgentRunContext("duplicate-module-run", {
+      lifecycleGeneration,
+      registeredAt: 100,
+    });
+    releaseOriginalLease?.("admitted");
+
+    expect(first.getAgentRunContext("duplicate-module-run")?.lastActiveAt).toBeUndefined();
+    expect(first.sweepStaleRunContexts(500)).toBe(1);
+    first.resetAgentEventsForTest();
+    clock.mockRestore();
   });
 });
 
