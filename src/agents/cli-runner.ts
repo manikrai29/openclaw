@@ -344,6 +344,8 @@ async function persistCliAssistantTranscript(params: {
   runParams: RunCliAgentParams;
   text: string;
   modelId: string;
+  cliSessionId?: string;
+  nativeAssistantId?: string;
   usage?: {
     input?: number;
     output?: number;
@@ -360,6 +362,35 @@ async function persistCliAssistantTranscript(params: {
     return true;
   }
   try {
+    const assistantMessage = buildAssistantMessage({
+      model: {
+        api: "cli",
+        provider: runParams.provider,
+        id: params.modelId,
+      },
+      content: [{ type: "text", text: params.text }],
+      stopReason: "stop",
+      usage: buildUsageWithNoCost({
+        input: params.usage?.input,
+        output: params.usage?.output,
+        cacheRead: params.usage?.cacheRead,
+        cacheWrite: params.usage?.cacheWrite,
+        totalTokens: params.usage?.total,
+      }),
+    });
+    // Claude's assistant UUID is the native turn identity shared with its JSONL history.
+    // Persist it at the writer so unequal live/imported renderings reconcile without text guesses.
+    const message =
+      isClaudeCliProvider(runParams.provider) && params.cliSessionId && params.nativeAssistantId
+        ? {
+            ...assistantMessage,
+            __openclaw: {
+              importedFrom: "claude-cli",
+              cliSessionId: params.cliSessionId,
+              externalId: params.nativeAssistantId,
+            },
+          }
+        : assistantMessage;
     const result = await appendExactAssistantMessageToSessionTranscript({
       sessionKey: runParams.sessionKey,
       agentId: runParams.agentId,
@@ -368,22 +399,7 @@ async function persistCliAssistantTranscript(params: {
       idempotencyKey: `cli-assistant:${runParams.runId}`,
       config: runParams.config,
       beforeMessageWrite: runAgentHarnessBeforeMessageWriteHook,
-      message: buildAssistantMessage({
-        model: {
-          api: "cli",
-          provider: runParams.provider,
-          id: params.modelId,
-        },
-        content: [{ type: "text", text: params.text }],
-        stopReason: "stop",
-        usage: buildUsageWithNoCost({
-          input: params.usage?.input,
-          output: params.usage?.output,
-          cacheRead: params.usage?.cacheRead,
-          cacheWrite: params.usage?.cacheWrite,
-          totalTokens: params.usage?.total,
-        }),
-      }),
+      message,
     });
     if (!result.ok) {
       log.warn(`CLI assistant transcript persistence skipped: ${result.reason}`);
@@ -1342,6 +1358,8 @@ export async function runPreparedCliAgent(
           // Persisting them here would duplicate the same visible assistant reply.
           text: sourceReplyWasDelivered ? "" : assistantText,
           modelId: context.modelId,
+          cliSessionId: effectiveCliSessionId,
+          nativeAssistantId: output.resumeCheckpointId,
           usage: output.usage,
         });
         // A stateless backend may emit an id, but it never becomes continuity.
