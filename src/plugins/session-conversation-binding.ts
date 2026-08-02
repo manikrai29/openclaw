@@ -5,6 +5,7 @@ import {
   unbindConversationBindingRecord,
 } from "../bindings/records.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { resolveGlobalMap } from "../shared/global-singleton.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel-constants.js";
 import { bindConversationNow, buildPluginBindingIdentity } from "./conversation-binding.js";
 import type {
@@ -17,7 +18,10 @@ const log = createSubsystemLogger("plugins/binding");
 // Serializes bind+finalize+rollback per session so a failing older attempt
 // can never unbind or restore over a newer successful one (all session binds
 // go through this in-process seam).
-const pluginSessionBindTails = new Map<string, Promise<void>>();
+const pluginSessionBindTails = resolveGlobalMap<string, Promise<void>>(
+  Symbol.for("openclaw.pluginSessionBindTails"),
+  "close-only",
+);
 
 /** Binds a plugin-owned runtime to one authenticated Control UI session. */
 export async function bindPluginSessionConversation(params: {

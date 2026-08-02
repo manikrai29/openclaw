@@ -1,5 +1,10 @@
 /** Process-local admission for visible child starts awaiting registry insertion. */
-const pendingVisibleChildren = new Map<string, number>();
+import { resolveGlobalMap } from "../../shared/global-singleton.js";
+
+const pendingVisibleChildren = resolveGlobalMap<string, number>(
+  Symbol.for("openclaw.pendingVisibleChildren"),
+  "close-only",
+);
 
 type VisibleChildReservation =
   | { ok: false; activeChildren: number }

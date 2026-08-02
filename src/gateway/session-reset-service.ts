@@ -82,6 +82,7 @@ import {
   handleSessionStateSessionReset,
   recordSessionCreated,
 } from "../sessions/session-state-events.js";
+import { resolveGlobalMap } from "../shared/global-singleton.js";
 import {
   forgetActiveSessionForShutdown,
   listActiveSessionsForShutdown,
@@ -102,7 +103,22 @@ import {
   resolveSessionStoreKey,
 } from "./session-utils.js";
 
-const mcpRunEndWatchers = new Map<string, Promise<void>>();
+type McpRunEndWatcher = {
+  cancel: () => void;
+  promise: Promise<void>;
+};
+
+const mcpRunEndWatchers = resolveGlobalMap<string, McpRunEndWatcher>(
+  Symbol.for("openclaw.mcpRunEndWatchers"),
+  async (watchers) => {
+    const active = [...watchers.values()];
+    for (const watcher of active) {
+      watcher.cancel();
+    }
+    await Promise.allSettled(active.map((watcher) => watcher.promise));
+    watchers.clear();
+  },
+);
 
 const ACP_RUNTIME_CLEANUP_TIMEOUT_MS = 15_000;
 
@@ -447,9 +463,15 @@ async function ensureSessionRuntimeCleanup(params: {
     if (mcpRunEndWatchers.has(sessionId)) {
       return;
     }
-    const watcherRef: { current?: Promise<void> } = {};
-    const watcher = (async () => {
-      while (await embeddedAgent.waitForEmbeddedAgentRunEnd(sessionId, null)) {
+    let cancelWatcher = () => {};
+    const cancelled = new Promise<false>((resolve) => {
+      cancelWatcher = () => resolve(false);
+    });
+    const watcherRef: { current?: McpRunEndWatcher } = {};
+    const promise = (async () => {
+      while (
+        await Promise.race([embeddedAgent.waitForEmbeddedAgentRunEnd(sessionId, null), cancelled])
+      ) {
         // A replacement can register after the wait promise settles but before
         // this continuation runs. Keep the required retirement armed for it.
         if (embeddedAgent.isEmbeddedAgentRunActive(sessionId)) {
@@ -462,9 +484,10 @@ async function ensureSessionRuntimeCleanup(params: {
         return;
       }
     })();
+    const watcher = { cancel: cancelWatcher, promise };
     watcherRef.current = watcher;
     mcpRunEndWatchers.set(sessionId, watcher);
-    void watcher
+    void promise
       .catch((error: unknown) => {
         logVerbose(`sessions cleanup: failed to disarm deferred MCP retirement: ${String(error)}`);
       })
