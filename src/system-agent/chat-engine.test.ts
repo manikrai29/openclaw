@@ -846,6 +846,45 @@ describe("SystemAgentChatEngine", () => {
     },
   );
 
+  it("accepts a stale bridge acknowledgement after the QR owner completes", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(1_800_000_000_000);
+    try {
+      let completeOwner!: (result: { ok: boolean }) => void;
+      const ownerDone = new Promise<{ ok: boolean }>((resolve) => {
+        completeOwner = resolve;
+      });
+      const engine = new SystemAgentChatEngine({
+        runAgentTurn: async () => null,
+        planWithAssistant: async () => null,
+        deps: { loadOverview: fakeOverviewLoader() },
+        supportsQrCode: true,
+        runChannelSetupWizard: async (_channel: string, prompter: WizardPrompter) => {
+          await prompter.qrCode?.({
+            title: "Link a device",
+            message: "Scan this QR code, then continue.",
+            text: QR_TEXT,
+            dismissed: ownerDone,
+            expiresAtMs: Date.now() + 60_000,
+          });
+        },
+      });
+
+      const prompt = await engine.handle("connect telegram");
+      expect(prompt.qrDataUrl).toMatch(/^data:image\/png;base64,/u);
+
+      completeOwner({ ok: true });
+      await vi.waitFor(() => expect(engine.hasPendingQrCode()).toBe(false));
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      const done = await engine.handle("Continue");
+      expect(done.text).toContain("telegram is configured");
+      expect(done.qrDataUrl).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("releases bridged QR bytes while the producer prepares its next step", async () => {
     let acknowledged = false;
     let releaseProducer = () => {};
@@ -888,11 +927,104 @@ describe("SystemAgentChatEngine", () => {
         }
       ).wizardBridge?.step,
     ).toBeNull();
+    expect(engine.hasPendingQrCode()).toBe(true);
 
     releaseProducer();
     const done = await continuation;
     expect(done.qrDataUrl).toBeUndefined();
     expect(done.text).toContain("telegram is configured");
+    expect(engine.hasPendingQrCode()).toBe(false);
+  });
+
+  it("bounds QR eviction protection while the producer stalls after acknowledgement", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(1_800_000_000_000);
+    try {
+      const engine = new SystemAgentChatEngine({
+        runAgentTurn: async () => null,
+        planWithAssistant: async () => null,
+        deps: { loadOverview: fakeOverviewLoader() },
+        supportsQrCode: true,
+        runChannelSetupWizard: async (_channel: string, prompter: WizardPrompter) => {
+          await prompter.qrCode?.({
+            title: "Link a device",
+            message: "Scan this QR code, then continue.",
+            text: QR_TEXT,
+          });
+          await new Promise<void>(() => {});
+        },
+      });
+
+      const prompt = await engine.handle("connect telegram");
+      expect(prompt.qrDataUrl).toMatch(/^data:image\/png;base64,/u);
+      const continuation = engine.handle("Continue");
+      await vi.waitFor(() => expect(engine.hasPendingQrCode()).toBe(true));
+
+      await vi.advanceTimersByTimeAsync(SYSTEM_AGENT_HOSTED_WIZARD_TIMEOUT_MS);
+
+      expect(engine.hasPendingQrCode()).toBe(false);
+      await expect(continuation).resolves.toMatchObject({
+        text: expect.stringContaining("cancelled"),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("expires an owner-dismissed QR before a stale acknowledgement", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(1_800_000_000_000);
+    try {
+      let completeOwner!: () => void;
+      const ownerDone = new Promise<void>((resolve) => {
+        completeOwner = resolve;
+      });
+      const engine = new SystemAgentChatEngine({
+        runAgentTurn: async () => null,
+        planWithAssistant: async () => null,
+        deps: { loadOverview: fakeOverviewLoader() },
+        supportsQrCode: true,
+        runChannelSetupWizard: async (_channel: string, prompter: WizardPrompter) => {
+          await prompter.qrCode?.({
+            title: "Link a device",
+            message: "Scan this QR code, then continue.",
+            text: QR_TEXT,
+            dismissed: ownerDone,
+          });
+          await new Promise<void>(() => {});
+        },
+      });
+
+      const prompt = await engine.handle("connect telegram");
+      expect(prompt.qrDataUrl).toMatch(/^data:image\/png;base64,/u);
+      completeOwner();
+      await vi.waitFor(() =>
+        expect(
+          (
+            engine as unknown as {
+              wizardBridge: { step: { qrDataUrl?: string } | null } | null;
+            }
+          ).wizardBridge?.step?.qrDataUrl,
+        ).toBeUndefined(),
+      );
+      expect(engine.hasPendingQrCode()).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(SYSTEM_AGENT_HOSTED_WIZARD_TIMEOUT_MS);
+
+      expect(engine.hasPendingQrCode()).toBe(false);
+      expect(
+        (
+          engine as unknown as {
+            wizardBridge: { qrExpired: boolean } | null;
+          }
+        ).wizardBridge?.qrExpired,
+      ).toBe(true);
+      await expect(engine.handle("Continue")).resolves.toMatchObject({
+        text: expect.stringContaining("expired"),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("expires an abandoned hosted QR wizard and releases its bridged bytes", async () => {
@@ -973,6 +1105,94 @@ describe("SystemAgentChatEngine", () => {
       const expired = await engine.handle("Continue");
       expect(expired.text).toContain("expired");
       expect(expired.qrDataUrl).toBeUndefined();
+      expect(engine.hasPendingQrCode()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires an expired owner QR without cancelling its in-flight operation", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(1_800_000_000_000);
+    try {
+      let finishOwner!: () => void;
+      const owner = new Promise<void>((resolve) => {
+        finishOwner = resolve;
+      });
+      const engine = new SystemAgentChatEngine({
+        runAgentTurn: async () => null,
+        planWithAssistant: async () => null,
+        deps: { loadOverview: fakeOverviewLoader() },
+        supportsQrCode: true,
+        runChannelSetupWizard: async (_channel: string, prompter: WizardPrompter) => {
+          await prompter.qrCode?.({
+            title: "Link a device",
+            message: "Scan this QR code, then continue.",
+            text: QR_TEXT,
+            dismissed: owner,
+            expiresAtMs: Date.now() + 60_000,
+          });
+          await owner;
+        },
+      });
+
+      const prompt = await engine.handle("connect telegram");
+      expect(prompt.qrExpiresAtMs).toBe(Date.now() + 60_000);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(engine.hasPendingQrCode()).toBe(true);
+      await expect(engine.handle("Continue")).resolves.toMatchObject({
+        text: expect.stringContaining("still finishing the attempt"),
+      });
+
+      finishOwner();
+      await vi.waitFor(() => expect(engine.hasPendingQrCode()).toBe(false));
+      await expect(engine.handle("Continue")).resolves.toMatchObject({
+        text: expect.stringContaining("telegram is configured"),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets an acknowledged owner QR finish after its presentation deadline", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(1_800_000_000_000);
+    try {
+      let finishOwner!: () => void;
+      const owner = new Promise<void>((resolve) => {
+        finishOwner = resolve;
+      });
+      const engine = new SystemAgentChatEngine({
+        runAgentTurn: async () => null,
+        planWithAssistant: async () => null,
+        deps: { loadOverview: fakeOverviewLoader() },
+        supportsQrCode: true,
+        runChannelSetupWizard: async (_channel: string, prompter: WizardPrompter) => {
+          await prompter.qrCode?.({
+            title: "Link a device",
+            message: "Scan this QR code, then continue.",
+            text: QR_TEXT,
+            dismissed: owner,
+            expiresAtMs: Date.now() + 60_000,
+          });
+          await owner;
+        },
+      });
+
+      const prompt = await engine.handle("connect telegram");
+      expect(prompt.qrDataUrl).toMatch(/^data:image\/png;base64,/u);
+      const continuation = engine.handle("Continue");
+      await vi.waitFor(() => expect(engine.hasPendingQrCode()).toBe(true));
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(engine.hasPendingQrCode()).toBe(true);
+      finishOwner();
+      await expect(continuation).resolves.toMatchObject({
+        text: expect.stringContaining("telegram is configured"),
+      });
       expect(engine.hasPendingQrCode()).toBe(false);
     } finally {
       vi.useRealTimers();

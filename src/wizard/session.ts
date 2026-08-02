@@ -89,7 +89,7 @@ class WizardSessionPrompter implements WizardPrompter {
           params.text,
           QR_PNG_DATA_URL_MAX_LENGTH,
         );
-        const result = await this.prompt({
+        const step = this.createStep({
           type: "select",
           title: params.title,
           message: params.message,
@@ -99,6 +99,14 @@ class WizardSessionPrompter implements WizardPrompter {
           ...(params.expiresAtMs !== undefined ? { qrExpiresAtMs: params.expiresAtMs } : {}),
           executor: "client",
         });
+        const answer = this.session.awaitAnswer(step, undefined, params.dismissed !== undefined);
+        if (params.dismissed) {
+          void params.dismissed.then(
+            () => this.session.dismissStep(step.id, { value: true }),
+            (error: unknown) => this.session.dismissStep(step.id, { error }),
+          );
+        }
+        const result = await answer;
         return Boolean(result);
       };
     }
@@ -292,9 +300,13 @@ export class WizardSession {
   private currentStep: WizardStep | null = null;
   private progressSteps: WizardStep[] = [];
   private deliveredProgressStepIds = new Set<string>();
+  private dismissedStepIds = new Set<string>();
   private stepDeferred: Deferred<WizardStep | null> | null = null;
   private pendingTerminalResolution = false;
   private cancellationLocked = false;
+  private qrPresentationOwned = false;
+  private qrPresentationHasExternalOwner = false;
+  private readonly onQrPresentationOwnerSettled: ((stepId: string) => void) | undefined;
   private settled = false;
   private pendingExternalUrl: string | undefined;
   private answerDeferred = new Map<
@@ -315,8 +327,13 @@ export class WizardSession {
       signal: AbortSignal,
       session: WizardSession,
     ) => Promise<void>,
-    options?: { timeoutMs?: number; supportsQrCode?: boolean },
+    options?: {
+      timeoutMs?: number;
+      supportsQrCode?: boolean;
+      onQrPresentationOwnerSettled?: (stepId: string) => void;
+    },
   ) {
+    this.onQrPresentationOwnerSettled = options?.onQrPresentationOwnerSettled;
     const prompter = new WizardSessionPrompter(this, options?.supportsQrCode === true);
     if (options?.timeoutMs !== undefined) {
       this.expiryTimer = setTimeout(() => this.cancel(), options.timeoutMs);
@@ -372,6 +389,11 @@ export class WizardSession {
   async answer(stepId: string, value: unknown): Promise<string | undefined> {
     const pending = this.answerDeferred.get(stepId);
     if (!pending) {
+      // A remote host can retain a step after its owner dismisses it. Accept one stale
+      // acknowledgement so the host can pump the already-advanced session.
+      if (this.dismissedStepIds.delete(stepId)) {
+        return undefined;
+      }
       // Gateway-owned progress steps never block the provider run. Older
       // clients still acknowledge every rendered step, so accept that stale
       // acknowledgement while newer clients poll without an answer.
@@ -399,6 +421,41 @@ export class WizardSession {
     return undefined;
   }
 
+  private rememberDismissedStep(stepId: string): void {
+    this.dismissedStepIds.add(stepId);
+    if (this.dismissedStepIds.size <= 64) {
+      return;
+    }
+    const oldest = this.dismissedStepIds.values().next().value;
+    if (oldest) {
+      this.dismissedStepIds.delete(oldest);
+    }
+  }
+
+  dismissStep(stepId: string, result: { value: unknown } | { error: unknown }): boolean {
+    // Owner settlement matters even after the client acknowledged the QR; the host may still
+    // be enforcing the credential deadline while the runner applies the truthful owner result.
+    this.onQrPresentationOwnerSettled?.(stepId);
+    const pending = this.answerDeferred.get(stepId);
+    if (!pending) {
+      return false;
+    }
+    this.answerDeferred.delete(stepId);
+    this.rememberDismissedStep(stepId);
+    if (this.currentStep?.id === stepId) {
+      if (this.currentStep.qrDataUrl) {
+        delete this.currentStep.qrDataUrl;
+      }
+      this.currentStep = null;
+    }
+    if ("error" in result) {
+      pending.deferred.reject(result.error);
+    } else {
+      pending.deferred.resolve(result.value);
+    }
+    return true;
+  }
+
   cancel(): boolean {
     if (this.status !== "running" || this.cancellationLocked) {
       return false;
@@ -420,6 +477,7 @@ export class WizardSession {
     this.answerDeferred.clear();
     this.progressSteps = [];
     this.deliveredProgressStepIds.clear();
+    this.dismissedStepIds.clear();
     this.resolveStep(null);
     return true;
   }
@@ -431,6 +489,39 @@ export class WizardSession {
 
   get signal(): AbortSignal {
     return this.abortController.signal;
+  }
+
+  /** Keep a wizard eviction-protected while its QR-owned operation is still in flight. */
+  hasOwnedQrPresentation(): boolean {
+    return this.qrPresentationOwned && this.status === "running" && !this.settled;
+  }
+
+  /** True when a producer promise, rather than the acknowledgement, owns QR completion. */
+  hasExternalQrPresentationOwner(): boolean {
+    return this.hasOwnedQrPresentation() && this.qrPresentationHasExternalOwner;
+  }
+
+  /** Retire an expired credential while its external owner finishes or rejects the operation. */
+  expireOwnedQrPresentation(stepId: string): boolean {
+    if (!this.hasExternalQrPresentationOwner()) {
+      return false;
+    }
+    const pending = this.answerDeferred.get(stepId);
+    if (!pending) {
+      return false;
+    }
+    this.answerDeferred.delete(stepId);
+    this.rememberDismissedStep(stepId);
+    if (this.currentStep?.id === stepId) {
+      if (this.currentStep.qrDataUrl) {
+        delete this.currentStep.qrDataUrl;
+      }
+      this.currentStep = null;
+    }
+    // Presentation expiry is not an owner failure. Release the prompt so the runner can
+    // keep awaiting the dependency-owned result without treating expiry as confirmation loss.
+    pending.deferred.resolve(true);
+    return true;
   }
 
   pushStep(step: WizardStep) {
@@ -512,10 +603,16 @@ export class WizardSession {
   async awaitAnswer(
     step: WizardStep,
     validate?: (value: string) => string | undefined,
+    qrPresentationHasExternalOwner = false,
   ): Promise<unknown> {
     if (this.status !== "running") {
       throw new Error("wizard: session not running");
     }
+    // A later interactive step proves the QR-owned operation finished. Release the
+    // eviction guard there; a runner stalled between steps remains protected by its QR timer.
+    this.qrPresentationOwned = Boolean(step.qrDataUrl);
+    this.qrPresentationHasExternalOwner =
+      this.qrPresentationOwned && qrPresentationHasExternalOwner;
     this.pushStep(step);
     const deferred = createDeferred<unknown>();
     this.answerDeferred.set(step.id, { deferred, text: step.type === "text", validate });

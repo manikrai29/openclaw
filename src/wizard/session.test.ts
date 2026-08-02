@@ -201,6 +201,155 @@ describe("WizardSession", () => {
     });
   });
 
+  test("dismisses an active QR when its owner operation settles", async () => {
+    const onQrPresentationOwnerSettled = vi.fn();
+    let dismiss!: () => void;
+    const dismissed = new Promise<void>((resolve) => {
+      dismiss = resolve;
+    });
+    const session = new WizardSession(
+      async (prompter) => {
+        await prompter.qrCode?.({
+          title: "Link a device",
+          message: "Scan this QR code, then continue.",
+          text: QR_TEXT,
+          dismissed,
+        });
+        await prompter.text({ message: "Next step" });
+      },
+      { supportsQrCode: true, onQrPresentationOwnerSettled },
+    );
+
+    const prompt = await session.next();
+    if (!prompt.step) {
+      throw new Error("expected QR acknowledgement step");
+    }
+    const deliveredStep = prompt.step;
+    expect(deliveredStep.qrDataUrl).toBe(QR_DATA_URL);
+    expect(session.hasOwnedQrPresentation()).toBe(true);
+
+    dismiss();
+    await Promise.resolve();
+    const next = await session.next();
+
+    expect(deliveredStep.qrDataUrl).toBeUndefined();
+    expect(onQrPresentationOwnerSettled).toHaveBeenCalledWith(deliveredStep.id);
+    expect(next.step).toMatchObject({ type: "text", message: "Next step" });
+    expect(session.hasOwnedQrPresentation()).toBe(false);
+    await expect(session.answer(deliveredStep.id, true)).resolves.toBeUndefined();
+    await expect(session.answer(deliveredStep.id, true)).rejects.toThrow("wizard: no pending step");
+    if (!next.step) {
+      throw new Error("expected next wizard step");
+    }
+    await session.answer(next.step.id, "done");
+    await session.whenSettled();
+    expect(session.hasOwnedQrPresentation()).toBe(false);
+  });
+
+  test("reports QR owner settlement after the client already acknowledged", async () => {
+    const onQrPresentationOwnerSettled = vi.fn();
+    let settleOwner!: () => void;
+    const owner = new Promise<void>((resolve) => {
+      settleOwner = resolve;
+    });
+    const session = new WizardSession(
+      async (prompter) => {
+        await prompter.qrCode?.({
+          title: "Link a device",
+          message: "Scan this QR code, then continue.",
+          text: QR_TEXT,
+          dismissed: owner,
+        });
+      },
+      { supportsQrCode: true, onQrPresentationOwnerSettled },
+    );
+
+    const prompt = await session.next();
+    if (!prompt.step) {
+      throw new Error("expected QR acknowledgement step");
+    }
+    await session.answer(prompt.step.id, true);
+    await session.whenSettled();
+    expect(onQrPresentationOwnerSettled).not.toHaveBeenCalled();
+
+    settleOwner();
+    await Promise.resolve();
+    expect(onQrPresentationOwnerSettled).toHaveBeenCalledWith(prompt.step.id);
+  });
+
+  test("retires an expired QR while its external owner operation keeps running", async () => {
+    let settleOwner!: () => void;
+    const owner = new Promise<void>((resolve) => {
+      settleOwner = resolve;
+    });
+    let acknowledged: boolean | undefined;
+    const session = new WizardSession(
+      async (prompter) => {
+        acknowledged = await prompter.qrCode?.({
+          title: "Link a device",
+          message: "Scan this QR code, then continue.",
+          text: QR_TEXT,
+          dismissed: owner,
+        });
+        await owner;
+      },
+      { supportsQrCode: true },
+    );
+
+    const prompt = await session.next();
+    if (!prompt.step) {
+      throw new Error("expected QR acknowledgement step");
+    }
+    const deliveredStep = prompt.step;
+
+    expect(session.expireOwnedQrPresentation(deliveredStep.id)).toBe(true);
+    await vi.waitFor(() => expect(acknowledged).toBe(true));
+
+    expect(deliveredStep.qrDataUrl).toBeUndefined();
+    expect(session.hasExternalQrPresentationOwner()).toBe(true);
+    await expect(session.answer(deliveredStep.id, true)).resolves.toBeUndefined();
+
+    settleOwner();
+    await session.whenSettled();
+    expect(session.getStatus()).toBe("done");
+  });
+
+  test("dismisses an active QR and surfaces an owner operation rejection", async () => {
+    let rejectOwner!: (error: Error) => void;
+    const dismissed = new Promise<void>((_resolve, reject) => {
+      rejectOwner = reject;
+    });
+    const session = new WizardSession(
+      async (prompter) => {
+        await prompter.qrCode?.({
+          title: "Link a device",
+          message: "Scan this QR code, then continue.",
+          text: QR_TEXT,
+          dismissed,
+        });
+      },
+      { supportsQrCode: true },
+    );
+
+    const prompt = await session.next();
+    if (!prompt.step) {
+      throw new Error("expected QR acknowledgement step");
+    }
+    const deliveredStep = prompt.step;
+
+    rejectOwner(new Error("link failed"));
+    await Promise.resolve();
+    const result = await session.next();
+
+    expect(deliveredStep.qrDataUrl).toBeUndefined();
+    expect(result).toMatchObject({
+      done: true,
+      status: "error",
+      error: expect.stringContaining("link failed"),
+    });
+    await expect(session.answer(deliveredStep.id, true)).resolves.toBeUndefined();
+  });
+
   test("reports QR rendering failures before presenting a wizard step", async () => {
     qrImageMocks.renderQrPngDataUrlWithinLimit.mockRejectedValueOnce(
       new Error("QR rendering failed"),

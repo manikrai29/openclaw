@@ -154,7 +154,9 @@ type ActiveWizardBridge = {
   session: WizardSession;
   step: WizardStep | null;
   expiryTimer: ReturnType<typeof setTimeout> | undefined;
+  expiryKind: "presentation" | "cancellation" | undefined;
   qrExpiresAtMs: number | undefined;
+  qrStepId: string | undefined;
   qrExpired: boolean;
   kind: "channel" | "skills" | "search" | "gateway" | "memory-import";
   label: string;
@@ -258,6 +260,7 @@ async function defaultChannelSetupWizardRunner(
   channel: string,
   prompter: WizardPrompterLike,
   beforePersistentApply: (runtime: RuntimeEnv) => Promise<void>,
+  abortSignal: AbortSignal,
 ): Promise<HostedWizardCompletion> {
   const {
     createChannelOnboardingPostWriteHookCollector,
@@ -279,6 +282,7 @@ async function defaultChannelSetupWizardRunner(
         skipDmPolicyPrompt: true,
         skipConfirm: true,
         beforePersistentEffect: async () => await beforePersistentApply(runtime),
+        abortSignal,
         onPostWriteHook: (hook) => postWriteHooks.collect(hook),
       }),
       afterWrite: async (committedConfig) => {
@@ -693,9 +697,11 @@ export class SystemAgentChatEngine {
     return this.pending !== null;
   }
 
-  /** A visible QR must keep its owning wizard alive until acknowledgement or expiry. */
+  /** A QR-owning wizard stays protected until its runner can no longer mutate setup state. */
   hasPendingQrCode(): boolean {
-    return Boolean(this.wizardBridge?.step?.qrDataUrl);
+    return Boolean(
+      this.wizardBridge?.step?.qrDataUrl || this.wizardBridge?.session.hasOwnedQrPresentation(),
+    );
   }
 
   /** A persistent effect that crossed its final authority check must settle before restart. */
@@ -1551,15 +1557,15 @@ export class SystemAgentChatEngine {
     const beforePersistentApply = async (runtime: RuntimeEnv) => {
       await this.requirePersistentApplyInference(runtime);
     };
-    const runWizard =
-      this.opts.runChannelSetupWizard ??
-      ((ch: string, prompter: WizardPrompterLike, guard: (runtime: RuntimeEnv) => Promise<void>) =>
-        defaultChannelSetupWizardRunner(ch, prompter, guard));
+    const runWizard = this.opts.runChannelSetupWizard;
     return await this.startHostedWizard({
       kind: "channel",
       label: channel,
       autoSelectChannel: channel,
-      run: (prompter) => runWizard(channel, prompter, beforePersistentApply),
+      run: (prompter, signal) =>
+        runWizard
+          ? runWizard(channel, prompter, beforePersistentApply)
+          : defaultChannelSetupWizardRunner(channel, prompter, beforePersistentApply, signal),
     });
   }
 
@@ -1633,7 +1639,7 @@ export class SystemAgentChatEngine {
     label: string;
     autoSelectChannel?: string;
     memoryImportProviders?: MemoryImportProviderOutcome[];
-    run: (prompter: WizardPrompterLike) => Promise<HostedWizardRunResult>;
+    run: (prompter: WizardPrompterLike, signal: AbortSignal) => Promise<HostedWizardRunResult>;
   }): Promise<string> {
     // Disposal may race an admitted model turn. Recheck at the ownership
     // boundary so that turn cannot install a fresh wizard, secret, or timer.
@@ -1646,21 +1652,31 @@ export class SystemAgentChatEngine {
         : {}),
     };
     const session = new WizardSession(
-      async (prompter) => {
-        const result = await params.run(prompter);
+      async (prompter, signal) => {
+        const result = await params.run(prompter, signal);
         if (typeof result === "string") {
           completion.status = result;
         } else if (result) {
           completion.memoryImport = result;
         }
       },
-      { supportsQrCode: this.opts.supportsQrCode === true },
+      {
+        supportsQrCode: this.opts.supportsQrCode === true,
+        onQrPresentationOwnerSettled: (stepId) => {
+          const activeBridge = this.wizardBridge;
+          if (activeBridge?.session === session) {
+            this.handleWizardQrOwnerDismissal(activeBridge, stepId);
+          }
+        },
+      },
     );
     const bridge: ActiveWizardBridge = {
       session,
       step: null,
       expiryTimer: undefined,
+      expiryKind: undefined,
       qrExpiresAtMs: undefined,
+      qrStepId: undefined,
       qrExpired: false,
       kind: params.kind,
       label: params.label,
@@ -1682,28 +1698,89 @@ export class SystemAgentChatEngine {
       clearTimeout(bridge.expiryTimer);
       bridge.expiryTimer = undefined;
     }
+    bridge.expiryKind = undefined;
     bridge.qrExpiresAtMs = undefined;
+    bridge.qrStepId = undefined;
   }
 
   private armWizardQrExpiry(bridge: ActiveWizardBridge): void {
     this.clearWizardExpiry(bridge);
     bridge.qrExpired = false;
     const abandonmentExpiresAtMs = Date.now() + SYSTEM_AGENT_HOSTED_WIZARD_TIMEOUT_MS;
+    const ownerExpiresAtMs = bridge.step?.qrExpiresAtMs;
     bridge.qrExpiresAtMs =
-      bridge.step?.qrExpiresAtMs === undefined
+      ownerExpiresAtMs === undefined
         ? abandonmentExpiresAtMs
-        : Math.min(bridge.step.qrExpiresAtMs, abandonmentExpiresAtMs);
+        : Math.min(ownerExpiresAtMs, abandonmentExpiresAtMs);
+    bridge.expiryKind =
+      ownerExpiresAtMs !== undefined &&
+      ownerExpiresAtMs <= abandonmentExpiresAtMs &&
+      bridge.session.hasExternalQrPresentationOwner()
+        ? "presentation"
+        : "cancellation";
+    bridge.qrStepId = bridge.step?.id;
+    const expiresAtMs = bridge.qrExpiresAtMs;
     bridge.expiryTimer = setTimeout(
       () => {
-        this.expireWizardQr(bridge);
+        this.expireWizardQr(bridge, expiresAtMs);
       },
-      Math.max(0, bridge.qrExpiresAtMs - Date.now()),
+      Math.max(0, expiresAtMs - Date.now()),
     );
     bridge.expiryTimer.unref?.();
   }
 
-  private expireWizardQr(bridge: ActiveWizardBridge): void {
-    if (this.wizardBridge !== bridge || !bridge.step?.qrDataUrl) {
+  private handleWizardQrOwnerDismissal(bridge: ActiveWizardBridge, stepId: string): void {
+    if (this.wizardBridge !== bridge || bridge.qrStepId !== stepId) {
+      return;
+    }
+    // The credential owner has a truthful result, but its runner may still be applying it.
+    // Retire the stale QR step and replace its credential deadline with bounded runner ownership.
+    bridge.step = null;
+    bridge.qrExpired = false;
+    this.armWizardRunnerExpiry(bridge, stepId);
+  }
+
+  private armWizardRunnerExpiry(bridge: ActiveWizardBridge, stepId: string): void {
+    this.clearWizardExpiry(bridge);
+    const expiresAtMs = Date.now() + SYSTEM_AGENT_HOSTED_WIZARD_TIMEOUT_MS;
+    bridge.qrExpiresAtMs = expiresAtMs;
+    bridge.expiryKind = "cancellation";
+    bridge.qrStepId = stepId;
+    bridge.expiryTimer = setTimeout(() => {
+      this.expireWizardQr(bridge, expiresAtMs);
+    }, SYSTEM_AGENT_HOSTED_WIZARD_TIMEOUT_MS);
+    bridge.expiryTimer.unref?.();
+    void bridge.session.whenSettled().then(() => {
+      if (this.wizardBridge === bridge && bridge.qrExpiresAtMs === expiresAtMs) {
+        this.clearWizardExpiry(bridge);
+      }
+    });
+  }
+
+  private expireWizardQr(
+    bridge: ActiveWizardBridge,
+    expectedExpiresAtMs = bridge.qrExpiresAtMs,
+  ): void {
+    // Owner dismissal scrubs QR bytes before the runner necessarily advances.
+    // The armed deadline still owns that bridge; only rearming or clearing it invalidates expiry.
+    if (
+      this.wizardBridge !== bridge ||
+      expectedExpiresAtMs === undefined ||
+      bridge.qrExpiresAtMs !== expectedExpiresAtMs
+    ) {
+      return;
+    }
+    if (
+      bridge.expiryKind === "presentation" &&
+      bridge.qrStepId !== undefined &&
+      bridge.session.hasExternalQrPresentationOwner()
+    ) {
+      const stepId = bridge.qrStepId;
+      // The client may already have acknowledged the QR. Either way, expiry retires only
+      // the credential presentation; the external owner keeps durable post-scan work alive.
+      bridge.qrExpired = bridge.session.expireOwnedQrPresentation(stepId);
+      bridge.step = null;
+      this.armWizardRunnerExpiry(bridge, stepId);
       return;
     }
     bridge.session.cancel();
@@ -2028,6 +2105,9 @@ export class SystemAgentChatEngine {
       this.expireWizardQr(bridge);
     }
     if (bridge.qrExpired) {
+      if (bridge.session.hasExternalQrPresentationOwner()) {
+        return "This setup QR code expired. Setup is still finishing the attempt; choose Continue again shortly.";
+      }
       this.clearWizardBridge();
       // A queued acknowledgement belongs to the expired credential. Other input is a fresh
       // command and must continue through normal turn routing instead of being consumed here.
@@ -2052,7 +2132,11 @@ export class SystemAgentChatEngine {
     }
     // Stop publishing the step before the producer resumes. WizardSession scrubs QR bytes after
     // successful validation; failures restore the intact prompt and its expiry timer for retry.
-    this.clearWizardExpiry(bridge);
+    // Keep a QR's abandonment timer alive while its owner finishes after acknowledgement.
+    // The next step or terminal result clears it in pumpWizardBridge.
+    if (!step.qrDataUrl && !bridge.session.hasOwnedQrPresentation()) {
+      this.clearWizardExpiry(bridge);
+    }
     bridge.step = null;
     const validationError = await bridge.session.answer(step.id, answer.value);
     if (validationError) {

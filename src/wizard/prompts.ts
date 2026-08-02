@@ -63,6 +63,8 @@ export type WizardQrCodeParams = {
   text: string;
   /** Absolute Unix-millisecond deadline supplied by the QR credential owner. */
   expiresAtMs?: number;
+  /** Owner lifecycle that dismisses the QR after the underlying operation settles. */
+  dismissed?: Promise<unknown>;
 };
 
 export type WizardPrompter = {
